@@ -1,0 +1,252 @@
+#!/usr/bin/env bash
+
+# See: https://stackoverflow.com/questions/430078/shell-script-templates
+# See: https://google.github.io/styleguide/shellguide.html
+#
+# Script your way into a fresh Gitea on K8S
+# https://medium.com/nerd-for-tech/script-your-way-into-a-fresh-gitea-on-k8s-d5e92ad9dd76
+
+# Create a user in Gitea
+# Configure the repository in Git to be added to the remote user in Gitea
+# Clone the repository into a local folder, using either HTTPs over a socks5 proxy, or SSH.
+
+NS=gitea
+CONTAINER=gitea
+CONFIG=/data/gitea/conf/app.ini
+
+GIT_BASE_DIR=$(git rev-parse --show-toplevel)
+CLUSTER_NAME="mycluster"
+PROXY_URL="localhost:8080"
+GIT_HOSTNAME="gitea"
+DNS_ZONE_NAME="mydomain.internal"
+GIT_HOST_URL=$GIT_HOSTNAME.$CLUSTER_NAME.$DNS_ZONE_NAME
+
+ARGOCD_USERNAME="argocd"
+ARGOCD_EMAIL="info@mailbox.mydomain.internal"
+ARGOCD_GIT_PFX="-argocd-git"
+ARGOCD_REPOSITORY_NAME="argocd-repo"
+ARGOCD_REPOSITORY_DESCR="ArgoCD Repository"
+INITIAL_BRANCH="main"
+SSH_LOC=~/.ssh
+SSH_CONFIG=$SSH_LOC/config
+
+
+#
+# Get the first of the pods that are created.
+function get_pod_name(){
+  local pod_name=$(kubectl -n $NS get pod -l app=gitea --no-headers -o custom-columns=":metadata.name"  |head -n 1)
+  echo $pod_name
+}
+
+
+#
+# Execute a gitea command in the Gitea pod-container.
+function exec_gitea_cmd(){
+  local command="gitea --config $CONFIG $1" 
+  local pod_name=$(get_pod_name)
+  echo "Gitea POD: $NS/$pod_name:$CONTAINER"
+  kubectl -n $NS exec $pod_name -c $CONTAINER -it -- $command 
+}
+
+#
+# Create a gitea user.
+function create_gitea_user(){
+  local username=$1
+  local password=$2
+  local email=$3
+  local is_admin=${4:-false} 
+  local gitea_command="admin user create --username $username --password $password --email $email" 
+  if [[ "$is_admin" == "true" ]]; then
+    echo "Create user $username as admin"
+    gitea_command+=" --admin"
+    else
+    echo "Create user $username as regular user"
+  fi 
+  exec_gitea_cmd "$gitea_command"
+  if [[ "$is_admin" == "true" ]]; then
+    echo "Regenerate keys"
+    exec_gitea_cmd "admin regenerate keys"
+    echo "Regenerate hooks"
+    exec_gitea_cmd "admin regenerate hooks"
+  fi
+}
+
+#
+# Create a gitea system user.
+function create_gitea_system_user(){
+  local username=$1
+  local password=$2
+  local email=$3
+  local gitea_command="admin user create --username $username --password $password --email $email --must-change-password=false" 
+  echo "Create user $username as system user"
+  exec_gitea_cmd "$gitea_command"
+}
+
+
+#
+# Generate an SSH Key
+# Call: generate_ssh_key $CLUSTER_NAME $ARGOCD_EMAIL
+function generate_ssh_key(){
+    local cluster_name=$1
+    local email_address=$2
+    local ssh_key_name=$cluster_name$ARGOCD_GIT_PFX
+    if [ -f $SSH_LOC/$ssh_key_name ]; then
+        loginfo "Key $SSH_LOC/$ssh_key_name for $email_address already exists; skipping it."
+    else
+        loginfo "Generate rsa key $SSH_LOC/$ssh_key_name"
+        ssh-keygen -t rsa -C "$email_address" -f $SSH_LOC/$ssh_key_name -P ""
+    fi
+}
+
+
+#
+# Add a Public Key as SSH key to Gitea user
+# Call: add_ssh_key_to_gitea_user $CLUSTER_NAME $gitea_admin_username $gitea_admin_password $ARGOCD_USERNAME
+function add_ssh_key_to_gitea_user(){
+    local cluster_name=$1
+    local gitea_admin_username="$2"
+    local gitea_admin_password="$3"
+    local gitea_username="$4"
+    local key_name=$cluster_name$ARGOCD_GIT_PFX
+    local pub_key=$key_name.pub
+    loginfo "Get PKCS8 key: $SSH_LOC/$pub_key for $gitea_username"
+    local gitea_user_pub_key=$(ssh-keygen -f $SSH_LOC/$pub_key -e -m pkcs8);
+    logdebug "Assemble payload with public key"
+    local payload=$(jq -n '{key: $ARGS.named["key"], read_only: true, title: $ARGS.named["title"]}' --arg key "$gitea_user_pub_key" --arg title "key-$gitea_username");
+    logdebug "Add key to $GIT_HOSTNAME.$cluster_name.$DNS_ZONE_NAME/api/v1/admin/users/$gitea_username/keys" 
+    curl -X POST -k \
+        -H  "Content-Type: application/json" \
+        --socks5-hostname $PROXY_URL \
+        -d "$payload" \
+        -u "$gitea_admin_username:$gitea_admin_password" \
+        $GIT_HOSTNAME.$cluster_name.$DNS_ZONE_NAME/api/v1/admin/users/$gitea_username/keys
+}
+
+
+#
+# Add a Repository to Gitea user
+# Call:
+# add_repository_to_user $CLUSTER_NAME \
+#             "$gitea_admin_username" \
+#             "$gitea_admin_password" \
+#             "$ARGOCD_USERNAME" \
+#             "$ARGOCD_REPOSITORY_NAME" \
+#             "$INITIAL_BRANCH" \
+#             "$ARGOCD_REPOSITORY_DESCR"
+function add_repository_to_user(){
+    local cluster_name=$1
+    local gitea_admin_username="$2"
+    local gitea_admin_password="$3"
+    local gitea_username="$4"
+    local repo_name=$5
+    local default_branch="$6"
+    local description="$7"
+    logdebug "Assemble payload for repository"
+    jq_json='{ auto_init: true,
+        default_branch: $ARGS.named["default_branch"],
+        description: $ARGS.named["description"],
+        name: $ARGS.named["name"],
+        private: true
+    }'
+    logdebug "JSON: $jq_json"
+    local payload=$(jq -n "$jq_json" \
+      --arg default_branch "$default_branch" \
+      --arg description "$description" \
+      --arg name "$repo_name" \
+    );
+
+    logdebug "Add repository $repo_name to $GIT_HOST_URL/api/v1/admin/users/$gitea_username/repos through proxy $PROXY_URL" 
+    curl -X POST -k \
+        -H  "Content-Type: application/json" \
+        --socks5-hostname $PROXY_URL \
+        -d "$payload" \
+        -u "$gitea_admin_username:$gitea_admin_password" \
+        https://$GIT_HOSTNAME.$cluster_name.$DNS_ZONE_NAME/api/v1/admin/users/$gitea_username/repos
+}
+
+
+#
+# Add Gitea host to SSH Config
+# Call: add_gitea_host_to_ssh_config $CLUSTER_NAME $ARGOCD_USERNAME
+#
+# Gitea server on mycluster
+# Host gitea.mycluster.mydomain.internal 
+#   ServerAliveInterval 60
+#   HostName gitea.mycluster.mydomain.internal
+#   IdentityFile /home/oracle/.ssh/mycluster-argocd-git
+#   User argocd
+#   ProxyCommand ncat --proxy localhost:8080 --proxy-type socks5 --proxy-dns remote %h %p
+function add_gitea_host_to_ssh_config(){
+    local cluster_name=$1
+    local gitea_user_name=$2
+    local ssh_key_name=$cluster_name$ARGOCD_GIT_PFX
+    if grep -q "Host $GIT_HOST_URL" $SSH_CONFIG; then
+        echo "Host $GIT_HOST_URL already added to $SSH_CONFIG"
+    else
+        echo "Add host $GIT_HOST_URL to $SSH_CONFIG using key $ssh_key_name";
+        cat <<EOT >> $SSH_CONFIG 
+# Gitea server on $
+Host $GIT_HOST_URL $cluster_name
+  ServerAliveInterval 60
+  HostName $GIT_HOST_URL
+  IdentityFile $SSH_LOC/$ssh_key_name
+  User $gitea_user_name
+  # StrictHostKeyChecking no
+  ProxyCommand ncat --proxy $PROXY_URL --proxy-type socks5 --proxy-dns remote %h %p
+EOT
+    fi
+}
+
+
+#
+# Add a Public Key as SSH key to Gitea user
+# Call:
+# clone_repository $CLUSTER_NAME \
+#             "$ARGOCD_USERNAME" \
+#             "$ARGOCD_REPOSITORY_NAME"
+function clone_repository(){
+    local cluster_name=$1
+    local gitea_username="$2"
+    local repo_name=$3
+    local argocd_clone_dir="$GIT_BASE_DIR/../$cluster_name/$repo_name"
+    if [ -d $argocd_clone_dir/.git ]; then 
+        logwarn "Folder $argocd_clone_dir already contains a Git repository, so skip clone." 
+    else
+        loginfo "Clone $gitea_username/$repo_name into $argocd_clone_dir"
+        mkdir -p $argocd_clone_dir
+        git clone git@$GIT_HOST_URL:$gitea_username/$repo_name.git $argocd_clone_dir
+    fi
+}
+
+
+#
+# Add an SSH key to the new Gitea user
+#!/bin/bash
+###############################################################################
+# Create a tunnel and guard it.
+#
+# Oracle Consulting Netherlands
+#
+# History
+# -------
+# 2024-08-22, M. van den Akker, Initial Creation
+#
+###############################################################################
+export TUNNEL_HOST=vm-bastion
+export TUNNEL_PORT=8080
+export TUNNEL_USER=opc
+export RSA_KEY=~/.ssh/id_rsa_makker
+export SLEEP_INTERVAL=10
+while true
+do
+  ssh_ps=$(ps -ef |grep ssh | grep $TUNNEL_HOST | grep $TUNNEL_PORT)
+  exit_code=$?
+  ssh_pid=$(echo $ssh_ps | tr -s ' ' | cut -d' ' -f2)
+  if [[ "$exit_code" == 0 ]]; then
+    echo "SSH Tunnel for $TUNNEL_USER@$TUNNEL_HOST is already running with pid $ssh_pid"
+  else
+    echo "Start SSH Tunnel for $TUNNEL_USER@$TUNNEL_HOST with key $RSA_KEY"
+    ssh -D $TUNNEL_PORT -q -fN -i $RSA_KEY $TUNNEL_USER@$TUNNEL_HOST
+  fi
+  sleep $SLEEP_INTERVAL
+done
